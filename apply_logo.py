@@ -1,151 +1,210 @@
 import bpy
 import sys
-import os
 import math
 from mathutils import Vector
-
 
 # ---------- ARGS ----------
 argv = sys.argv
 args = argv[argv.index("--") + 1 :]
 
-SVG_PATH = os.path.abspath(args[0])
-OUTPUT_STL = os.path.abspath(args[1])
-X = float(args[2])
-Y = float(args[3])
-SCALE = float(args[4]) * 100
-# ROT = float(args[5])
+svgA = args[0]
+svgB = args[1]
+OUTPUT = args[2]
 
-print("🔥 APPLY LOGO START")
-print("SVG:", SVG_PATH)
-print("OUT:", OUTPUT_STL)
-# print("X,Y,SCALE,ROT:", X, Y, SCALE, ROT)
+xA, yA, scaleA, rotA, heightA = map(float, args[3:8])
+xB, yB, scaleB, rotB, heightB = map(float, args[8:13])
 
-# ---------- CLEAN SCENE (keep template objects) ----------
-# Only delete previous logo objects if they exist
-for obj in list(bpy.data.objects):
-    if obj.name.startswith("LOGO_"):
-        bpy.data.objects.remove(obj, do_unlink=True)
+RAMP_WIDTH = 111.0
+RAMP_HEIGHT = 31.0
 
-# ---------- IMPORT SVG ----------
-before = set(bpy.context.scene.objects)
-
-bpy.ops.import_curve.svg(filepath=SVG_PATH)
-
-after = set(bpy.context.scene.objects)
-curves = [o for o in (after - before) if o.type == "CURVE"]
-
-if not curves:
-    raise Exception("❌ No curves imported")
-
-print(f"[INFO] Imported {len(curves)} curves")
-
-# Rename for tracking
-for i, obj in enumerate(curves):
-    obj.name = f"LOGO_{i}"
-
-# ---------- CURVE SETUP ----------
-for obj in curves:
-    obj.data.dimensions = "2D"
-    obj.data.fill_mode = "BOTH"
-    obj.data.use_fill_caps = True
-    obj.data.extrude = 0.05
-
-    obj.data.resolution_u = 64
-    obj.data.render_resolution_u = 128
-
-    # 🔥 ensure closed shapes (fixes caps)
-    for spline in obj.data.splines:
-        spline.use_cyclic_u = True
-
-# ---------- SELECT ----------
-bpy.ops.object.select_all(action="DESELECT")
-for o in curves:
-    o.select_set(True)
-
-bpy.context.view_layer.objects.active = curves[0]
-
-# ---------- CONVERT TO MESH ----------
-bpy.ops.object.convert(target="MESH")
-
-meshes = [o for o in bpy.context.selected_objects if o.type == "MESH"]
-
-if not meshes:
-    raise Exception("❌ No mesh created")
-
-# ---------- JOIN ----------
-if len(meshes) > 1:
-    bpy.ops.object.join()
-
-logo = bpy.context.active_object
-logo.name = "LOGO_FINAL"
-
-# ---------- FIX ORIGIN ----------
-bpy.ops.object.origin_set(type="ORIGIN_GEOMETRY", center="BOUNDS")
-
-# ---------- APPLY TRANSFORMS ----------
-# 🔥 scale correctly (not *=)
-# ---------- NORMALIZE SIZE ----------
-bpy.context.view_layer.update()
-
-bbox = [logo.matrix_world @ Vector(v) for v in logo.bound_box]
-
-min_x = min(v.x for v in bbox)
-max_x = max(v.x for v in bbox)
-
-width = max_x - min_x
-
-if width == 0:
-    raise Exception("Logo width is zero")
-
-# normalize to width = 1
-normalize = 1.0 / width
-logo.scale = (normalize, normalize, normalize)
-
-bpy.context.view_layer.update()
+print("START CLEAN PIPELINE")
 
 
-# ---------- APPLY USER SCALE (REAL WORLD UNITS) ----------
-logo.scale = (logo.scale.x * SCALE, logo.scale.y * SCALE, logo.scale.z)
+# ---------- IMPORT ----------
+def import_svg(svg):
+    before = set(bpy.context.scene.objects)
+    bpy.ops.import_curve.svg(filepath=svg)
+    after = set(bpy.context.scene.objects)
+    return [o for o in (after - before) if o.type == "CURVE"]
 
-# 🔥 rotate (Z axis)
-# logo.rotation_euler[2] = math.radians(ROT)
 
-# 🔥 position (flip Y from UI)
-logo.location.x = X
-logo.location.y = -Y
+# ---------- BUILD ----------
+def build_logo(curves, name):
+    if not curves:
+        return None
 
-# ---------- PLACE ON TEMPLATE ----------
-base = bpy.data.objects.get("Base")
+    for obj in curves:
+        obj.data.dimensions = "2D"
+        obj.data.fill_mode = "BOTH"
+        for s in obj.data.splines:
+            s.use_cyclic_u = True
 
-if base:
-    # put logo on top of base
-    logo.location.z = base.dimensions.z
+    bpy.ops.object.select_all(action="DESELECT")
+    for o in curves:
+        o.select_set(True)
 
-# ---------- OPTIONAL BOOLEAN ----------
-if base:
-    print("[INFO] Applying boolean union")
+    bpy.context.view_layer.objects.active = curves[0]
+    bpy.ops.object.convert(target="MESH")
 
-    mod = base.modifiers.new(name="LogoBoolean", type="BOOLEAN")
-    mod.operation = "UNION"
-    mod.object = logo
+    meshes = [o for o in bpy.context.selected_objects if o.type == "MESH"]
+    if len(meshes) > 1:
+        bpy.ops.object.join()
 
-    bpy.context.view_layer.objects.active = base
-    bpy.ops.object.modifier_apply(modifier=mod.name)
+    logo = bpy.context.active_object
+    logo.name = name
 
-    # remove logo after applying
-    bpy.data.objects.remove(logo, do_unlink=True)
+    bpy.ops.object.origin_set(type="ORIGIN_GEOMETRY", center="BOUNDS")
 
-    target = base
-else:
-    target = logo
+    return logo
+
+
+# ---------- SCALE + PLACE ----------
+def place(
+    obj,
+    target_x,
+    target_y,
+    target_width,
+    target_rot,
+):
+    import bpy
+    from mathutils import Vector
+    import math
+
+    print("\n========== NEW LOGO ==========")
+    print("INPUT:", target_x, target_y, target_width, target_rot)
+
+    # -------------------------------------------------
+    # APPLY TRANSFORMS FIRST (important for clean bbox)
+    # -------------------------------------------------
+    bpy.context.view_layer.objects.active = obj
+    bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
+
+    # -------------------------------------------------
+    # GET INITIAL BOUNDING BOX
+    # -------------------------------------------------
+    bbox = [obj.matrix_world @ Vector(v) for v in obj.bound_box]
+
+    min_x = min(v.x for v in bbox)
+    max_x = max(v.x for v in bbox)
+    min_y = min(v.y for v in bbox)
+    max_y = max(v.y for v in bbox)
+
+    width = max_x - min_x
+    center_x = (min_x + max_x) / 2
+    center_y = (min_y + max_y) / 2
+
+    print("INITIAL BBOX:")
+    print("  min:", min_x, min_y)
+    print("  max:", max_x, max_y)
+    print("  center:", center_x, center_y)
+    print("  width:", width)
+
+    # -------------------------------------------------
+    # SCALE TO TARGET WIDTH
+    # -------------------------------------------------
+    if width > 0:
+        scale_factor = target_width / width
+        obj.scale *= scale_factor
+
+        bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
+
+    # -------------------------------------------------
+    # ROTATION
+    # -------------------------------------------------
+    obj.rotation_euler[2] = math.radians(target_rot)
+
+    # -------------------------------------------------
+    # RE-CALCULATE BBOX AFTER SCALE
+    # -------------------------------------------------
+    bbox = [obj.matrix_world @ Vector(v) for v in obj.bound_box]
+
+    min_x = min(v.x for v in bbox)
+    max_x = max(v.x for v in bbox)
+    min_y = min(v.y for v in bbox)
+    max_y = max(v.y for v in bbox)
+
+    center_x = (min_x + max_x) / 2
+    center_y = (min_y + max_y) / 2
+
+    print("FINAL BBOX:")
+    print("  min:", min_x, min_y)
+    print("  max:", max_x, max_y)
+    print("  center:", center_x, center_y)
+
+    # -------------------------------------------------
+    # MOVE USING CENTER (THIS WAS THE BUG)
+    # -------------------------------------------------
+    dx = target_x - center_x
+    dy = target_y - center_y
+
+    obj.location.x += dx
+    obj.location.y += dy
+
+    print("MOVE DELTA:", dx, dy)
+
+    # -------------------------------------------------
+    # FINAL CHECK
+    # -------------------------------------------------
+    bbox = [obj.matrix_world @ Vector(v) for v in obj.bound_box]
+    min_x = min(v.x for v in bbox)
+    min_y = min(v.y for v in bbox)
+
+    print("AFTER MOVE min:", min_x, min_y)
+
+    # -------------------------------------------------
+    # SET HEIGHT
+    # -------------------------------------------------
+    # obj.location.z = z_height
+
+
+# ---------- EXTRUDE ----------
+def extrude_logo(logo, height):
+    bpy.ops.object.select_all(action="DESELECT")
+    logo.select_set(True)
+    bpy.context.view_layer.objects.active = logo
+
+    solid = logo.modifiers.new(name="solid", type="SOLIDIFY")
+    solid.thickness = height
+    solid.offset = 1
+
+    bpy.ops.object.modifier_apply(modifier=solid.name)
+
+
+# ---------- MAIN ----------
+logos = []
+
+# LOGO A
+curvesA = import_svg(svgA)
+logoA = build_logo(curvesA, "LOGO_A")
+
+if logoA:
+    place(logoA, xA, yA, scaleA, rotA)
+    extrude_logo(logoA, heightA)
+    logos.append(logoA)
+
+# LOGO B
+if svgB != "NONE":
+    curvesB = import_svg(svgB)
+    logoB = build_logo(curvesB, "LOGO_B")
+
+    if logoB:
+        place(logoB, xB, yB, scaleB, rotB)
+        extrude_logo(logoB, heightB)
+        logos.append(logoB)
+
 
 # ---------- EXPORT ----------
 bpy.ops.object.select_all(action="DESELECT")
-target.select_set(True)
+
+for obj in bpy.context.scene.objects:
+    if obj.type == "MESH":
+        obj.select_set(True)
 
 bpy.ops.wm.stl_export(
-    filepath=OUTPUT_STL, export_selected_objects=True, apply_modifiers=True
+    filepath=OUTPUT, export_selected_objects=True, apply_modifiers=True
+)
+bpy.ops.wm.save_as_mainfile(
+    filepath=OUTPUT + "blend.blend", export_selected_objects=True, apply_modifiers=True
 )
 
-print("✅ STL exported successfully")
+print("DONE")
